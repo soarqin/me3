@@ -52,7 +52,7 @@ pub enum AkOpenMode {
 pub fn find_override<'a>(
     mapping: &'a VfsOverrideMapping,
     input: &str,
-) -> Option<&'a VfsOverride<'a>> {
+) -> Option<&'a VfsOverride<'static>> {
     let input = strip_prefix(input);
     if input.ends_with(".wem") {
         let wem_path = format!("wem/{input}");
@@ -74,7 +74,10 @@ pub fn find_override<'a>(
     None
 }
 
-fn get_override<'a>(mapping: &'a VfsOverrideMapping, input: &str) -> Option<&'a VfsOverride<'a>> {
+fn get_override<'a>(
+    mapping: &'a VfsOverrideMapping,
+    input: &str,
+) -> Option<&'a VfsOverride<'static>> {
     for prefix in PREFIXES {
         let prefixed = format!("{prefix}/{input}");
         if let Some(replacement) = mapping.virtual_to_disk(&prefixed) {

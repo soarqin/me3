@@ -229,8 +229,10 @@ pub fn install(config: TelemetryConfig) -> Telemetry {
     #[cfg(not(feature = "sentry"))]
     let layer = tracing_subscriber::layer::Identity::new();
 
+    // Without a Sentry client every breadcrumb the layer converts is discarded, so only
+    // pay the per-event conversion cost when telemetry is enabled and a client exists.
     #[cfg(feature = "sentry")]
-    let layer = sentry::integrations::tracing::layer();
+    let layer = config.enabled.then(sentry::integrations::tracing::layer);
 
     tracing_subscriber::registry()
         .with(ErrorLayer::default())

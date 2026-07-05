@@ -27,7 +27,7 @@ undname = "2.1"
 xxhash-rust.workspace = true
 
 [dependencies.windows]
-features = ["Win32_Media", "Win32_System_Memory", "Win32_System_Kernel", "Win32_System_Threading"]
+features = ["Win32_Globalization", "Win32_Media", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading"]
 version = "0.62"
 
 [lints]

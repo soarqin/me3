@@ -96,6 +96,28 @@ impl Channel {
         Ok(())
     }
 
+    /// Send a message without ever blocking the calling thread: if the queue is full the
+    /// message is dropped.
+    ///
+    /// Use this for best-effort traffic (e.g. log forwarding) that must never stall a
+    /// latency-sensitive sender waiting on the receiving process to drain the queue.
+    pub fn send_lossy<M, E>(&self, msg: M) -> Result<(), SendError<E>>
+    where
+        M: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, E>>,
+        E: Source,
+    {
+        let bytes = to_bytes::<E>(&msg).map_err(SendError::Serialize)?;
+
+        match self.queue.write(&bytes) {
+            Ok(()) => {
+                self.has_messages.notify()?;
+                Ok(())
+            }
+            Err(WriteError::Full) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Try to enter the single threaded recv span, which returns an error if
     /// another thread has already entered.
     pub fn enter_recv_span<T, E>(&self) -> Result<RecvSpanGuard<'_, T, E>, SpanError>

@@ -165,6 +165,12 @@ impl BridgeToParent {
         Ok(())
     }
 
+    /// Send a [`MsgToParent`] to the parent process, dropping the message instead of
+    /// blocking when the channel is full.
+    pub fn send_lossy(&self, msg: MsgToParent) -> Result<(), SendError> {
+        self.shared.to_parent.send_lossy::<_, rancor::Error>(msg)
+    }
+
     /// Send a [`MsgToParent`] to the parent process.
     pub fn send(&self, msg: MsgToParent) -> Result<(), SendError> {
         self.shared.to_parent.send::<_, rancor::Error>(msg)
@@ -218,8 +224,10 @@ impl<F: Fn(Box<str>) -> MsgToParent + Clone> io::Write for LogWriter<F> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let str = str::from_utf8(buf).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
 
+        // Logs are best-effort: dropping under backpressure is preferable to stalling
+        // game threads while the parent process drains the queue.
         self.bridge
-            .send((self.to_msg)(str.into()))
+            .send_lossy((self.to_msg)(str.into()))
             .map_err(io::Error::other)?;
 
         Ok(str.len())

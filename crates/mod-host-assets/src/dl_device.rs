@@ -292,6 +292,44 @@ impl DlDeviceManagerGuard {
         }
     }
 
+    /// Returns the mounts to the device manager for good, consuming `vfs`.
+    ///
+    /// Mount ownership (including the game-allocated root strings) moves into
+    /// `bnd4_mounts`, so no copy of a `DlVirtualMount` ever exists twice.
+    pub fn push_vfs_mounts_permanent(&mut self, vfs: VfsMounts) {
+        let device_manager = unsafe { self.inner.as_mut() };
+
+        device_manager
+            .devices
+            .extend(&mut vfs.inner.iter().map(|m| m.device));
+
+        device_manager
+            .bnd4_mounts
+            .extend(&mut vfs.inner.into_iter());
+    }
+
+    /// Collects the distinct `open_file` implementations across all mounted BND4 devices.
+    pub fn bnd4_device_open_fns(&self) -> Vec<DlDeviceOpen> {
+        let device_manager = unsafe { self.inner.as_ref() };
+
+        let mut fns: Vec<DlDeviceOpen> = Vec::new();
+
+        for mount in device_manager.bnd4_mounts.iter() {
+            let open_file =
+                unsafe { ptr::read(&raw const mount.device.read().vtable.as_ref().open_file) };
+
+            if !fns.iter().any(|&f| f as usize == open_file as usize) {
+                fns.push(open_file);
+            }
+        }
+
+        fns
+    }
+
+    pub fn disk_device(&self) -> NonNull<DlDevice> {
+        unsafe { self.inner.as_ref() }.disk_device
+    }
+
     pub fn expand_path<'a>(&self, path: &'a [u16]) -> Cow<'a, [u16]> {
         let device_manager = unsafe { self.inner.as_ref() };
 

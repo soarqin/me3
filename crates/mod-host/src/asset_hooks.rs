@@ -1,10 +1,10 @@
 use std::{
     alloc::{GlobalAlloc, Layout},
     ffi::OsString,
-    fs::OpenOptions,
-    io::{Read, Write},
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Read, Write},
     os::windows::ffi::{OsStrExt, OsStringExt},
-    path::Path,
+    path::{Path, PathBuf},
     ptr::NonNull,
     slice,
     sync::{Arc, Mutex, OnceLock},
@@ -16,17 +16,17 @@ use me3_binary_analysis::{fd4_step::Fd4StepTables, rtti::ClassMap};
 use me3_launcher_attach_protocol::AttachConfig;
 use me3_mod_host_assets::{
     bhd5::Bhd5Header,
-    dl_device::{self, DlDeviceManager, DlFileOperator, VfsMounts},
+    dl_device::{self, DlDeviceManager, DlFileOperator},
     ebl::{mount_ebl, DlDeviceEblExt, EblFileManager},
     mapping::VfsOverrideMapping,
-    wwise::{self, find_wwise_open_file, AkOpenMode},
+    wwise::{find_wwise_open_file, AkOpenMode},
 };
 use me3_mod_host_types::{alloc::DlStdAllocator, string::DlUtf16String};
 use me3_mod_protocol::Game;
 use miniz_oxide::{
     deflate::compress_to_vec,
     inflate::stream::{inflate, InflateState},
-    DataFormat, MZFlush,
+    DataFormat, MZFlush, MZStatus,
 };
 use pkcs1::der::Decode;
 use rdvec::{RawVec, Vec as DynVec};
@@ -37,7 +37,66 @@ use xxhash_rust::xxh3;
 
 use crate::{alloc_hooks::MIMALLOC_DLALLOC, executable::Executable, host::ModHost};
 
-static VFS_MOUNTS: Mutex<VfsMounts> = Mutex::new(VfsMounts::new());
+fn read_cached_bhd(path: &Path, expected_len: usize) -> Result<Option<Vec<u8>>, eyre::Error> {
+    let mut cached = match OpenOptions::new().read(true).open(path) {
+        Ok(cached) => cached,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut cached_len_bytes = [0; 4];
+    match cached.read_exact(&mut cached_len_bytes) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+
+    if u32::from_le_bytes(cached_len_bytes) as usize != expected_len {
+        return Ok(None);
+    }
+
+    let mut compressed = vec![];
+    cached.read_to_end(&mut compressed)?;
+
+    let mut contents = vec![0; expected_len];
+    let mut state = InflateState::new_boxed(DataFormat::Raw);
+    let result = inflate(&mut state, &compressed, &mut contents, MZFlush::Finish);
+
+    if !matches!(result.status, Ok(MZStatus::StreamEnd))
+        || result.bytes_consumed != compressed.len()
+        || result.bytes_written != expected_len
+    {
+        return Err(eyre!(
+            "invalid cached BHD payload: status={:?}, consumed={}/{}, written={}/{}",
+            result.status,
+            result.bytes_consumed,
+            compressed.len(),
+            result.bytes_written,
+            expected_len,
+        ));
+    }
+
+    Ok(Some(contents))
+}
+
+fn write_cached_bhd(
+    cache_dir: &Path,
+    target_path: PathBuf,
+    file_size: u32,
+    contents: &[u8],
+) -> Result<(), eyre::Error> {
+    let compressed = compress_to_vec(contents, 7);
+    let mut temp = NamedTempFile::new_in(cache_dir)?;
+
+    temp.write_all(&file_size.to_le_bytes())?;
+    temp.write_all(&compressed)?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+
+    temp.persist(target_path)
+        .map(|_| ())
+        .map_err(|e| eyre!(e.error))
+}
 
 #[instrument(name = "assets", skip_all)]
 pub fn attach_override(
@@ -107,12 +166,19 @@ fn hook_file_init(
         .with_span(info_span!("hook"))
         .with_closure(move |p1, p2, trampoline| {
             let result = hook_device_manager(exe, mapping.clone())
-                .and_then(|_| hook_mount_ebl(attach_config.clone(), exe))
+                .and_then(|_| hook_mount_ebl(attach_config.clone(), exe, mapping.clone()))
                 .inspect_err(|e| error!("error" = &**e, "failed apply pre-hooks"));
 
             unsafe {
                 trampoline(p1, p2);
             }
+
+            // `STEP_Init` has now populated `virtual_roots` and finalized the working directory.
+            // The file hooks were live throughout, but lookup caching was disabled, so every
+            // lookup computed against the live (partial) state without pinning anything. Enable
+            // the caches now that the state is stable; on a `STEP_Init` re-run this also drops
+            // results cached under the previous device state.
+            mapping.reset_lookup_caches();
 
             if result.is_ok()
                 && let Err(e) = hook_ebl_utility(exe, &class_map, mapping.clone())
@@ -140,25 +206,89 @@ fn hook_ebl_utility(
 
     ModHost::get_attached()
         .hook(make_ebl_object)
-        .with_closure(move |p1, path, p3, trampoline| {
-            let mut device_manager = DlDeviceManager::lock(device_manager);
+        .with_closure({
+            let mapping = mapping.clone();
 
-            let expanded = unsafe { device_manager.expand_path(path.as_wide()) };
+            move |p1, path, p3, trampoline| {
+                // Overridden paths return `None` so the game falls back to its disk
+                // resolution, where the disk-device hook serves the loose file. All other
+                // paths go straight to the game: the mounts stay in the device manager
+                // permanently, so no per-call lock or mount push/pop is needed.
+                if mapping
+                    .virtual_to_disk_cached(unsafe { path.as_wide() }, |p| {
+                        DlDeviceManager::lock(device_manager).expand_path(p)
+                    })
+                    .is_some()
+                {
+                    return None;
+                }
 
-            if mapping
-                .virtual_to_disk(OsString::from_wide(&expanded))
-                .is_some()
-            {
-                return None;
+                unsafe { (trampoline)(p1, path, p3) }
             }
-
-            let _guard = device_manager.push_vfs_mounts(&VFS_MOUNTS.lock().unwrap());
-
-            unsafe { (trampoline)(p1, path, p3) }
         })
         .install()?;
 
+    hook_ebl_device_opens(exe, mapping)?;
+
     info!("applied asset override hook");
+
+    Ok(())
+}
+
+/// Guards direct opens on mounted BND4 devices (e.g. a root-prefixed `data0:/regulation.bin`),
+/// which would otherwise serve archive contents and shadow a loose-file override now that the
+/// mounts stay in the device manager. Overridden paths are routed through the disk device,
+/// whose hooked `open_file` rewrites them to the mod file.
+fn hook_ebl_device_opens(
+    exe: Executable,
+    mapping: Arc<VfsOverrideMapping>,
+) -> Result<(), eyre::Error> {
+    static HOOKED_OPEN_FNS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    let device_manager = locate_device_manager(exe)?;
+
+    let (open_fns, disk_device, disk_open) = {
+        let device_manager = DlDeviceManager::lock(device_manager);
+
+        (
+            device_manager.bnd4_device_open_fns(),
+            device_manager.disk_device(),
+            device_manager.open_disk_file(),
+        )
+    };
+
+    let mut hooked = HOOKED_OPEN_FNS.lock().unwrap();
+
+    for open_fn in open_fns {
+        if hooked.contains(&(open_fn as usize)) {
+            continue;
+        }
+
+        ModHost::get_attached()
+            .hook(open_fn)
+            .with_closure({
+                let mapping = mapping.clone();
+
+                move |device, path, path_cstr, p4, p5, p6, trampoline| {
+                    let has_override = unsafe { path.as_ref() }.get().is_ok_and(|path| {
+                        mapping
+                            .virtual_to_disk_cached(path.as_slice(), |p| {
+                                DlDeviceManager::lock(device_manager).expand_path(p)
+                            })
+                            .is_some()
+                    });
+
+                    if has_override {
+                        unsafe { disk_open(disk_device, path, path_cstr, p4, p5, p6) }
+                    } else {
+                        unsafe { trampoline(device, path, path_cstr, p4, p5, p6) }
+                    }
+                }
+            })
+            .install()?;
+
+        hooked.push(open_fn as usize);
+    }
 
     Ok(())
 }
@@ -177,11 +307,10 @@ fn hook_device_manager(
 
         move |path: &DlUtf16String| {
             let path = path.get().ok()?;
-            let expanded = DlDeviceManager::lock(device_manager).expand_path(path.as_slice());
 
-            let mapped_override = mapping.virtual_to_uid(OsString::from_wide(&expanded))?;
-
-            info!("override" = %mapped_override);
+            let mapped_override = mapping.virtual_to_uid_cached(path.as_slice(), |p| {
+                DlDeviceManager::lock(device_manager).expand_path(p)
+            })?;
 
             let mut path = path.clone();
 
@@ -199,7 +328,6 @@ fn hook_device_manager(
 
     ModHost::get_attached()
         .hook(open_disk_file)
-        .with_span(info_span!("hook"))
         .with_closure(move |p1, path, p3, p4, p5, p6, trampoline| {
             let file_operator = if let Some(path) = override_path(unsafe { path.as_ref() }) {
                 unsafe {
@@ -219,17 +347,12 @@ fn hook_device_manager(
             if let Some(file_operator) = file_operator {
                 static HOOK_RESULT: OnceLock<bool> = OnceLock::new();
 
-                if *HOOK_RESULT.get_or_init(|| hook_set_path(file_operator)) {
-                    return Some(file_operator);
-                }
+                let _ = HOOK_RESULT.get_or_init(|| hook_set_path(file_operator));
+
+                return Some(file_operator);
             }
 
-            unsafe {
-                VFS_MOUNTS
-                    .lock()
-                    .unwrap()
-                    .try_open_file(path, p3, p4, p5, p6)
-            }
+            None
         })
         .install()?;
 
@@ -250,9 +373,9 @@ fn hook_set_path(
     let override_path = move |path: &DlUtf16String| {
         let path = path.get().ok()?;
 
-        let expanded = DlDeviceManager::lock(device_manager).expand_path(path.as_slice());
-
-        let mapped_override = mapping.virtual_to_uid(OsString::from_wide(&expanded))?;
+        let mapped_override = mapping.virtual_to_uid_cached(path.as_slice(), |p| {
+            DlDeviceManager::lock(device_manager).expand_path(p)
+        })?;
 
         let mut path = path.clone();
 
@@ -280,7 +403,11 @@ fn hook_set_path(
 }
 
 #[instrument(name = "mount_ebl", skip_all)]
-fn hook_mount_ebl(attach_config: Arc<AttachConfig>, exe: Executable) -> Result<(), eyre::Error> {
+fn hook_mount_ebl(
+    attach_config: Arc<AttachConfig>,
+    exe: Executable,
+    mapping: Arc<VfsOverrideMapping>,
+) -> Result<(), eyre::Error> {
     fn load_cached_ebl<P, F>(
         exe: Executable,
         cache_path: P,
@@ -339,48 +466,34 @@ fn hook_mount_ebl(attach_config: Arc<AttachConfig>, exe: Executable) -> Result<(
 
         let cached_bhd_path = cache_path.as_ref().join(format!("{hash:032x?}.bhd.zz"));
 
-        // Create or open the cache file.
-        let mut cached = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(cached_bhd_path)?;
-
-        let cached_len = {
-            let mut cached_len_bytes = [0; 4];
-            cached
-                .read_exact(&mut cached_len_bytes)
-                .map(|_| u32::from_le_bytes(cached_len_bytes))
-                .ok()
+        let cached_contents = match original_len {
+            Some(len) => match read_cached_bhd(&cached_bhd_path, len as usize) {
+                Ok(contents) => contents,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %cached_bhd_path.display(),
+                        "invalid cached BHD; falling back to game decrypt"
+                    );
+                    let _ = fs::remove_file(&cached_bhd_path);
+                    None
+                }
+            },
+            None => None,
         };
 
-        // If the length of the cached file is zero the file has just been created.
-        // If the length does not match there was an error writing the cache or a hash collision.
-        if let Some(cached_len) = cached_len
-            && let Some(original_len) = original_len
-            && cached_len == original_len
-        {
-            let cached_len = cached_len as usize;
-
-            let mut compressed = vec![];
-            cached.read_to_end(&mut compressed)?;
-
-            // Opened a cached decrypted file, read, decompress and assign its contents.
+        if let Some(contents) = cached_contents {
+            // Opened a cached decrypted file, validate/decompress and assign its contents.
             // Use the game's own allocator as it will be freed with it later.
             let buf = unsafe {
                 let ptr = NonNull::new(
-                    allocator.alloc(Layout::from_size_align_unchecked(cached_len, 4096)),
+                    allocator.alloc(Layout::from_size_align_unchecked(contents.len(), 4096)),
                 )
                 .ok_or_eyre("failed to allocate buffer for cached file")?;
 
-                slice::from_raw_parts_mut(ptr.as_ptr(), cached_len)
+                slice::from_raw_parts_mut(ptr.as_ptr(), contents.len())
             };
-
-            let mut state = InflateState::new_boxed(DataFormat::Raw);
-            inflate(&mut state, &compressed, buf, MZFlush::Finish)
-                .status
-                .map_err(|e| eyre!("`miniz_oxide::inflate` failed with status={e:?}"))?;
+            buf.copy_from_slice(&contents);
 
             unsafe {
                 device
@@ -389,11 +502,8 @@ fn hook_mount_ebl(attach_config: Arc<AttachConfig>, exe: Executable) -> Result<(
                     .assign_bhd_contents(buf.as_mut_ptr().cast());
             }
 
-            VFS_MOUNTS.lock().unwrap().append(new_mounts);
+            device_manager.push_vfs_mounts_permanent(new_mounts);
         } else {
-            // Clear the file and let the game decrypt the original, before caching it.
-            cached.set_len(0)?;
-
             let snap = device_manager.snapshot()?;
 
             invoke_trampoline(&trampoline, &bhd_path)?;
@@ -413,13 +523,16 @@ fn hook_mount_ebl(attach_config: Arc<AttachConfig>, exe: Executable) -> Result<(
                     .ok_or_eyre("BHD header is null")?
             };
 
-            VFS_MOUNTS.lock().unwrap().append(new_mounts);
+            device_manager.push_vfs_mounts_permanent(new_mounts);
 
             // Successfully mounted the ebl, do not report subsequent caching errors.
-            let _ = cached
-                .write_all(&header.file_size().to_le_bytes())
-                .and_then(|_| cached.write_all(&compress_to_vec(header.as_slice(), 7)))
-                .and_then(|_| cached.flush());
+            let _ = write_cached_bhd(
+                cache_path.as_ref(),
+                cached_bhd_path,
+                header.file_size(),
+                header.as_slice(),
+            )
+            .inspect_err(|e| warn!(error = %e, "failed to write cached BHD"));
         }
 
         Ok(())
@@ -477,38 +590,28 @@ fn hook_mount_ebl(attach_config: Arc<AttachConfig>, exe: Executable) -> Result<(
         .hook(mount_ebl)
         .with_span(info_span!("hook"))
         .with_closure(move |p1, p2, p3, p4, p5, p6, trampoline| {
-            if attach_config.boot_boost && let Some(cache_path) = &attach_config.cache_path {
-                match load_cached_ebl(exe, cache_path, p2, p5, p4, |p2| unsafe {
-                    trampoline(p1, p2, p3, p4, p5, p6)
-                }) {
-                    Ok(()) => {
-                        return true;
-                    }
-                    Err(e) => {
-                        error!("error" = &*e, key = %unsafe { str::from_utf8(p5.as_bytes()).unwrap() });
+            let result = 'mount: {
+                if attach_config.boot_boost && let Some(cache_path) = &attach_config.cache_path {
+                    match load_cached_ebl(exe, cache_path, p2, p5, p4, |p2| unsafe {
+                        trampoline(p1, p2, p3, p4, p5, p6)
+                    }) {
+                        Ok(()) => break 'mount true,
+                        Err(e) => {
+                            error!("error" = &*e, key = %unsafe { str::from_utf8(p5.as_bytes()).unwrap() });
+                        }
                     }
                 }
-            }
 
-            if let Ok(device_manager) = locate_device_manager(exe) {
-                let mut device_manager = DlDeviceManager::lock(device_manager);
-
-                let snap = device_manager.snapshot();
-
-                let result = unsafe { trampoline(p1, p2, p3, p4, p5, p6) };
-
-                match snap {
-                    Ok(snap) => {
-                        let new = device_manager.extract_new(snap);
-                        VFS_MOUNTS.lock().unwrap().append(new);
-                    }
-                    Err(e) => error!("error" = &*eyre!(e), "snapshot error"),
-                }
-
-                result
-            } else {
                 unsafe { trampoline(p1, p2, p3, p4, p5, p6) }
+            };
+
+            // The mounts stay in the device manager permanently, so any device mounted
+            // after `STEP_Init` needs its `open_file` hooked for override precedence too.
+            if result && let Err(e) = hook_ebl_device_opens(exe, mapping.clone()) {
+                error!("error" = &*e, "failed to hook EBL device opens");
             }
+
+            result
         })
         .install()?;
 
@@ -528,13 +631,10 @@ fn try_hook_wwise(
 
     ModHost::get_attached()
         .hook(wwise_open_file)
-        .with_span(info_span!("hook"))
         .with_closure(move |p1, path, open_mode, p4, p5, p6, trampoline| {
             let path_string = unsafe { path.to_string().unwrap() };
 
-            if let Some(mapped_override) = wwise::find_override(&mapping, &path_string) {
-                info!("override" = %mapped_override);
-
+            if let Some(mapped_override) = mapping.wwise_override_cached(&path_string) {
                 // Force lookup to wwise's ordinary read (from disk) mode instead of the EBL read.
                 unsafe {
                     trampoline(
@@ -571,4 +671,62 @@ fn locate_device_manager(
         .get_or_init(|| DeviceManager(dl_device::find_device_manager(exe, Some(&MIMALLOC_DLALLOC))))
         .0
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_cached_bhd, write_cached_bhd};
+    use miniz_oxide::deflate::compress_to_vec;
+
+    #[test]
+    fn cached_bhd_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("cache.bhd.zz");
+        let contents = b"decrypted bhd contents";
+
+        write_cached_bhd(temp.path(), target.clone(), contents.len() as u32, contents).unwrap();
+
+        let cached = read_cached_bhd(&target, contents.len()).unwrap().unwrap();
+        assert_eq!(cached, contents);
+    }
+
+    #[test]
+    fn cached_bhd_length_mismatch_is_cache_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("cache.bhd.zz");
+        let contents = b"decrypted bhd contents";
+
+        write_cached_bhd(temp.path(), target.clone(), contents.len() as u32, contents).unwrap();
+
+        assert!(read_cached_bhd(&target, contents.len() + 1)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cached_bhd_rejects_truncated_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("cache.bhd.zz");
+        let contents = b"decrypted bhd contents";
+        let compressed = compress_to_vec(contents, 7);
+        let mut file = (contents.len() as u32).to_le_bytes().to_vec();
+        file.extend_from_slice(&compressed[..compressed.len() / 2]);
+
+        std::fs::write(&target, file).unwrap();
+
+        assert!(read_cached_bhd(&target, contents.len()).is_err());
+    }
+
+    #[test]
+    fn cached_bhd_rejects_garbage_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("cache.bhd.zz");
+        let contents = b"decrypted bhd contents";
+        let mut file = (contents.len() as u32).to_le_bytes().to_vec();
+        file.extend_from_slice(b"not deflate data");
+
+        std::fs::write(&target, file).unwrap();
+
+        assert!(read_cached_bhd(&target, contents.len()).is_err());
+    }
 }
